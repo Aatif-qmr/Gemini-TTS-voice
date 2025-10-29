@@ -92,6 +92,7 @@ const App: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedAudioUrl, setGeneratedAudioUrl] = useState<string | null>(null);
+  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -105,14 +106,20 @@ const App: React.FC = () => {
     setIsLoading(true);
     setError(null);
     setGeneratedAudioUrl(null);
+    setAudioBuffer(null);
 
     // Stop any currently playing audio
     if (audioSourceRef.current) {
+        audioSourceRef.current.onended = null; // Prevent onended from firing on stop
         audioSourceRef.current.stop();
         audioSourceRef.current.disconnect();
         audioSourceRef.current = null;
-        setIsPlaying(false);
     }
+    // If context is suspended, resume it so new audio can play
+    if (audioContextRef.current?.state === 'suspended') {
+        await audioContextRef.current.resume();
+    }
+    setIsPlaying(false);
     
     try {
       const base64Audio = await generateSpeech(text, selectedVoice);
@@ -124,18 +131,22 @@ const App: React.FC = () => {
       }
       
       const audioData = decode(base64Audio);
-      const audioBuffer = await decodeAudioData(audioData, audioContextRef.current, TTS_SAMPLE_RATE, TTS_CHANNEL_COUNT);
+      const newAudioBuffer = await decodeAudioData(audioData, audioContextRef.current, TTS_SAMPLE_RATE, TTS_CHANNEL_COUNT);
+      setAudioBuffer(newAudioBuffer);
       
-      const wavBlob = audioBufferToWav(audioBuffer);
+      const wavBlob = audioBufferToWav(newAudioBuffer);
       const url = URL.createObjectURL(wavBlob);
       setGeneratedAudioUrl(url);
 
       const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
+      source.buffer = newAudioBuffer;
       source.connect(audioContextRef.current.destination);
       source.onended = () => {
-          setIsPlaying(false);
-          audioSourceRef.current = null;
+          // Check if this source is still the active one before updating state
+          if (audioSourceRef.current === source) {
+            setIsPlaying(false);
+            audioSourceRef.current = null;
+          }
       };
       source.start();
       audioSourceRef.current = source;
@@ -145,10 +156,43 @@ const App: React.FC = () => {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.');
       setIsPlaying(false);
       setGeneratedAudioUrl(null);
+      setAudioBuffer(null);
     } finally {
       setIsLoading(false);
     }
   }, [text, selectedVoice]);
+
+  const handleTogglePlayPause = useCallback(async () => {
+    if (!audioContextRef.current || !audioBuffer) return;
+
+    if (isPlaying) {
+      await audioContextRef.current.suspend();
+      setIsPlaying(false);
+    } else {
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+        setIsPlaying(true);
+      } else {
+        // If playback finished, start from beginning
+        if (audioSourceRef.current) {
+            audioSourceRef.current.stop();
+            audioSourceRef.current.disconnect();
+        }
+        const newSource = audioContextRef.current.createBufferSource();
+        newSource.buffer = audioBuffer;
+        newSource.connect(audioContextRef.current.destination);
+        newSource.onended = () => {
+          if (audioSourceRef.current === newSource) {
+            setIsPlaying(false);
+            audioSourceRef.current = null;
+          }
+        };
+        newSource.start(0);
+        audioSourceRef.current = newSource;
+        setIsPlaying(true);
+      }
+    }
+  }, [isPlaying, audioBuffer]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-4 font-sans">
@@ -178,14 +222,14 @@ const App: React.FC = () => {
                 voices={VOICES}
                 selectedVoice={selectedVoice}
                 onVoiceChange={setSelectedVoice}
-                disabled={isLoading || isPlaying}
+                disabled={isLoading}
             />
         </div>
 
         <div className="space-y-3">
             <button
                 onClick={handleGenerateSpeech}
-                disabled={isLoading || isPlaying}
+                disabled={isLoading}
                 className="w-full flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-900/50 disabled:cursor-not-allowed text-white font-bold py-3 px-4 rounded-lg transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-indigo-500/50 transform hover:scale-105 disabled:scale-100"
             >
                 {isLoading ? (
@@ -196,13 +240,6 @@ const App: React.FC = () => {
                         </svg>
                         Generating...
                     </>
-                ) : isPlaying ? (
-                     <>
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.636 5.636a9 9 0 0112.728 0M8.464 15.536a5 5 0 010-7.072" />
-                        </svg>
-                        Playing...
-                    </>
                 ) : (
                     <>
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -212,18 +249,37 @@ const App: React.FC = () => {
                     </>
                 )}
             </button>
-            {generatedAudioUrl && (
-              <a
-                href={generatedAudioUrl}
-                download="gemini-tts-narration.wav"
-                className="w-full flex items-center justify-center bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-green-500/50"
-                aria-label="Download generated audio as WAV file"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                </svg>
-                Download Audio
-              </a>
+            {generatedAudioUrl && audioBuffer && (
+                <div className="flex items-center justify-between bg-gray-700/50 p-3 rounded-lg border border-gray-600">
+                    <button
+                        onClick={handleTogglePlayPause}
+                        className="flex items-center justify-center p-2 rounded-full bg-indigo-600 hover:bg-indigo-700 text-white transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500"
+                        aria-label={isPlaying ? "Pause audio" : "Play audio"}
+                    >
+                        {isPlaying ? (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M10 9v6m4-6v6" />
+                            </svg>
+                        ) : (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                               <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                            </svg>
+                        )}
+                    </button>
+                    <span className="text-gray-300 font-medium text-sm">
+                        {isPlaying ? 'Playing...' : audioContextRef.current?.state === 'suspended' ? 'Paused' : 'Ready to play'}
+                    </span>
+                    <a
+                        href={generatedAudioUrl}
+                        download="gemini-tts-narration.wav"
+                        className="flex items-center justify-center p-2 rounded-full bg-green-600 hover:bg-green-700 text-white transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-green-500"
+                        aria-label="Download generated audio as WAV file"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                    </a>
+                </div>
             )}
         </div>
       </div>
