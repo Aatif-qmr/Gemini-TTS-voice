@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Gemini TTS Narrator",
+  "description": "An application that converts text with narration instructions into speech using the Gemini API. Users can select from various voices to generate consistent audio narration.",
+  "requestFramePermissions": []
+}
